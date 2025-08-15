@@ -58,7 +58,7 @@ SUPPORTS_QWEN3     = transformers_version >= Version("4.50.3")
 SUPPORTS_QWEN3_MOE = transformers_version >= Version("4.50.3")
 SUPPORTS_FALCON_H1 = transformers_version >= Version("4.53.0")
 SUPPORTS_GEMMA3N   = transformers_version >= Version("4.53.0")
-
+SUPPORTS_GPTOSS    = transformers_version >= Version("4.55.0")
 if SUPPORTS_GEMMA:
     from .gemma  import FastGemmaModel
 if SUPPORTS_GEMMA2:
@@ -81,6 +81,7 @@ from ._utils import (
 global FORCE_FLOAT32
 FORCE_FLOAT32 = [
     "gemma3",
+    "gpt_oss",
 ]
 
 class FastLanguageModel(FastLlamaModel):
@@ -110,6 +111,14 @@ class FastLanguageModel(FastLlamaModel):
         disable_log_stats          = True,
         *args, **kwargs,
     ):
+        # Login to allow private models
+        if token is None: token = get_token()
+        if token is not None:
+            try:
+                from huggingface_hub import login
+                login(token = token)
+            except:
+                pass
         if load_in_8bit or full_finetuning:
             return FastModel.from_pretrained(
                 model_name                 = model_name,
@@ -320,15 +329,15 @@ class FastLanguageModel(FastLlamaModel):
                     f"to obtain the latest transformers build, then restart this session."\
                 )
             dispatch_model = FastQwen3Model if model_type == "qwen3" else FastQwen3MoeModel
-        elif model_type == "falcon_h1":
-            dispatch_model = FastFalconH1Model
-            if not SUPPORTS_FALCON_H1:
-                raise ImportError(
-                    f"Unsloth: Your transformers version of {transformers_version} does not support FalconH1.\n"\
-                    f"The minimum required version is 4.50.3.\n"\
-                    f'Try `pip install --upgrade "transformers>=4.50.3"`\n'\
-                    f"to obtain the latest transformers build, then restart this session."\
-                )
+        # elif model_type == "falcon_h1":
+        #     dispatch_model = FastFalconH1Model
+        #     if not SUPPORTS_FALCON_H1:
+        #         raise ImportError(
+        #             f"Unsloth: Your transformers version of {transformers_version} does not support FalconH1.\n"\
+        #             f"The minimum required version is 4.50.3.\n"\
+        #             f'Try `pip install --upgrade "transformers>=4.50.3"`\n'\
+        #             f"to obtain the latest transformers build, then restart this session."\
+        #         )
         # Temporary disable optimized Cohere until errors match
         # elif model_type == "cohere":
         #     dispatch_model = FastCohereModel
@@ -512,6 +521,13 @@ class FastModel(FastBaseModel):
         *args, **kwargs,
     ):
         if token is None: token = get_token()
+        # Login to allow private models
+        if token is not None:
+            try:
+                from huggingface_hub import login
+                login(token = token)
+            except:
+                pass
         if whisper_language is not None: assert(type(whisper_language) is str)
         if whisper_task is not None: assert(type(whisper_task) is str)
         SUPPORTS_BFLOAT16 = is_bfloat16_supported()
@@ -545,29 +561,77 @@ class FastModel(FastBaseModel):
 
         # Check versions
         lowered_model_name = model_name.lower()
+        os.environ["UNSLOTH_MODEL_NAME"] = lowered_model_name
         LATEST  = '\nPlease use transformers via `pip install --no-deps git+https://github.com/huggingface/transformers.git`'
         NIGHTLY = '\nPlease use nightly transformers via pip install --upgrade "transformers>=4.49.0"`'
+        # Pixtral
         if "pixtral" in lowered_model_name and transformers_version < Version("4.49.0"):
             raise RuntimeError("Unsloth: Pixtral only works on transformers >= 4.49.0." + LATEST)
+        # Qwen 2.5
         elif "qwen2.5" in lowered_model_name and transformers_version < Version("4.49.0"):
             raise RuntimeError("Unsloth: Qwen 2.5 only works on transformers >= 4.49.0." + LATEST)
+        # Gemma 3
         elif "gemma-3" in lowered_model_name and transformers_version < Version("4.50.0.dev0"):
             raise RuntimeError("Unsloth: Gemma 3 only works on transformers >= 4.50.0." + NIGHTLY)
+        # Cohere
         elif "c4ai-command-a-03-2025" in lowered_model_name and transformers_version < Version("4.50.0.dev0"):
             raise RuntimeError("Unsloth: Cohere's Command model only works on transformers >= 4.50.0." + NIGHTLY)
+        # Sesame
         elif "csm-1b" in lowered_model_name:
+            os.environ["UNSLOTH_COMPILE_DISABLE"] = "1" # Inference is too slow
             os.environ["UNSLOTH_DISABLE_STATIC_GENERATION"] = "1" # Sesame fails
-            os.environ["UNSLOTH_FORCE_CUSTOM_DTYPE"] = "torch.float16;if name.endswith(('_proj', 'fc1', 'fc2', 'codebook', 'head')): module.to(torch.float16)"
+            os.environ["UNSLOTH_FORCE_CUSTOM_DTYPE"] = \
+                "all;torch.float32;torch.float16;"\
+                "if name.endswith(('_proj', 'fc1', 'fc2', 'codebook', 'head')): module.to(torch.float16);"
+        # Granite 4
         elif 'granite-4' in lowered_model_name:
             # granite-4 rms norms are stored as 16 bit, but we upcast
             os.environ["UNSLOTH_UPCAST_LAYERNORM"] = "1"
             os.environ["UNSLOTH_DISABLE_STATIC_GENERATION"] = "1"
+        # Olmo 2
         elif "olmo-2" in lowered_model_name and transformers_version < Version("4.50.0.dev0"):
             raise RuntimeError("Unsloth: OLMo-2 only works on transformers >= 4.50.0." + NIGHTLY)
+        # Gemma 3N
         elif "gemma-3n" in lowered_model_name:
             os.environ["UNSLOTH_DISABLE_STATIC_GENERATION"] = "1"
+            os.environ["UNSLOTH_FORCE_CUSTOM_DTYPE"] = \
+                "float16;torch.float16;torch.float16;"\
+                "if name.endswith(('.conv')): module;"\
+                "from unsloth_zoo.temporary_patches.gemma3n import patch_Gemma3nConvNormAct_forward; patch_Gemma3nConvNormAct_forward()"
+            
             if transformers_version < Version("4.53.0"):
                 raise RuntimeError("Unsloth: Gemma 3N only works on transformers >= 4.53.0" + LATEST)
+        elif "falcon-h1" in lowered_model_name:
+            # Falcon must use float32 Triton ie TRITON_F32_DEFAULT = 'ieee'
+            # since Mamba kernels error out on using lower precision
+            os.environ["UNSLOTH_FORCE_CUSTOM_DTYPE"] = \
+                "float16;torch.float32;torch.float16;"\
+                "if name.endswith(('q_proj', 'k_proj', 'v_proj', 'o_proj', 'gate_proj', 'up_proj', 'down_proj', 'head')): module.to(torch.float16);"\
+                "os.environ['TRITON_F32_DEFAULT'] = 'ieee'"
+        elif "gpt-oss" in lowered_model_name:
+            os.environ["UNSLOTH_DISABLE_STATIC_GENERATION"] = "1"
+            # CCE fails on Tesla T4
+            # OutOfResources: out of resource: shared memory, Required: 98304, Hardware limit: 65536. Reducing block sizes or `num_stages`
+            os.environ["UNSLOTH_ENABLE_CCE"] = "0"
+            if not load_in_4bit:
+                # Only upcast MoE biases for MXFP4, not BnB
+                os.environ["UNSLOTH_FORCE_CUSTOM_DTYPE"] = \
+                    "all;None;None;"\
+                    "x = 'gate_up_proj_bias'\n"\
+                    "if hasattr(module, x): "\
+                    "setattr(module, x, torch.nn.Parameter(getattr(module, x).to(torch.float32)) if isinstance(getattr(module, x), torch.nn.Parameter) else getattr(module, x).to(torch.float32))\n"\
+                    "x = 'down_proj_bias'\n"\
+                    "if hasattr(module, x): "\
+                    "setattr(module, x, torch.nn.Parameter(getattr(module, x).to(torch.float32)) if isinstance(getattr(module, x), torch.nn.Parameter) else getattr(module, x).to(torch.float32))\n"\
+                    ";"
+            else:
+                # Set down projection compute dtype to be float32 for float16 machines
+                os.environ["UNSLOTH_FORCE_CUSTOM_DTYPE"] = \
+                    "all;None;None;"\
+                    "if 'down_projs' in name and hasattr(module, 'compute_dtype') and "\
+                    "torch.amax(dequantize_module_weight(module)) >= 1024:"\
+                    "module._pre_set_compute_dtype = torch.float32\n"\
+                    ";"
         else:
             for check_model_name in DISABLE_COMPILE_MODEL_NAMES:
                 if check_model_name in lowered_model_name:
@@ -706,7 +770,7 @@ class FastModel(FastBaseModel):
             if model_type_arch != "siglip": break
         global FORCE_FLOAT32
         for disable_name in FORCE_FLOAT32:
-            if (disable_name.lower() == model_type_arch.lower() or \
+            if (disable_name.lower() == model_type_arch.lower().replace("-", "_") or \
                 disable_name.lower() in model_name.lower()) and \
                 ((dtype == torch.float16) or not SUPPORTS_BFLOAT16):
                 os.environ["UNSLOTH_FORCE_FLOAT32"] = "1"
@@ -837,7 +901,7 @@ class FastModel(FastBaseModel):
                 trust_remote_code = trust_remote_code,
             )
             # Patch it as well!
-            model = FastBaseModel.post_patch_model(model, use_gradient_checkpointing)
+            model = FastBaseModel.post_patch_model(model, use_gradient_checkpointing, trust_remote_code  = trust_remote_code)
         pass
         return model, tokenizer
     pass
