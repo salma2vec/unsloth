@@ -330,7 +330,7 @@ def unsloth_save_model(
             old_username = None, private = private,
         )
 
-        getattr(model, "original_push_to_hub", tokenizer.push_to_hub)\
+        getattr(model, "original_push_to_hub", model.push_to_hub)\
         (
             repo_id            = save_directory,
             use_temp_dir       = use_temp_dir,
@@ -1195,6 +1195,41 @@ def save_to_gguf(
             f"--outfile {final_location} --vocab-type {vocab_type} "\
             f"--outtype {first_conversion} --concurrency {n_cpus} --pad-vocab"
     else:
+        # Fix up conversion script is possible
+        with open(convert_location, "rb") as f: converter_latest = f.read()
+        # Fix metadata
+        converter_latest = re.sub(
+            rb"(self\.metadata \= .+?\(.+?\)"\
+            rb"[\n]{1,}([\s]{4,}))",
+            rb"\1"\
+            rb"if hasattr(self.metadata, 'quantized_by'): self.metadata.quantized_by = 'Unsloth'\n"\
+            rb"\2if hasattr(self.metadata, 'repo_url'): self.metadata.repo_url = 'https://huggingface.co/unsloth'\n"\
+            rb"\2if hasattr(self.metadata, 'tags'): self.metadata.tags = ['unsloth', 'llama.cpp']\n"\
+            rb"\2",
+            converter_latest,
+        )
+
+        # Make mistral_common optional for now
+        # from x import y
+        converter_latest = re.sub(
+            rb"(from mistral_common[^\n\(]{1,})[\s]{0,}\n",
+            rb"try:\n    \1\nexcept:\n    pass\n",
+            converter_latest,
+        )
+        # from x import (y, z,)
+        converter_latest = re.sub(
+            rb"(from mistral_common[^\n\(]{1,}[\s]{0,}\(.+?\))",
+            rb"try:\n    \1\nexcept:\n    pass\n",
+            converter_latest,
+            flags = re.MULTILINE | re.DOTALL,
+        )
+
+        try:
+            # Write file
+            with open(convert_location, "wb") as file:
+                file.write(converter_latest)
+        except:
+            pass
         command = f"python {convert_location} {model_directory} "\
             f"--outfile {final_location} "\
             f"--outtype {first_conversion}"
@@ -1530,7 +1565,7 @@ def upload_to_huggingface(
         # We also upload a config.json file
         if create_config:
             import json
-            with open("_temporary_unsloth_config.json", "w") as file:
+            with open("_temporary_unsloth_config.json", "w", encoding = "utf-8") as file:
                 json.dump({"model_type" : model.config.model_type}, file, indent = 4)
             pass
             hf_api.upload_file(
@@ -1694,7 +1729,7 @@ def push_to_ollama_hub(username: str, model_name: str, tag: str):
         print(f"\nMODEL PUBLISHED FAILED WITH RETURN CODE {return_code}")
     else:
         print("\nMODEL PUBLISHED SUCCESSFULLY")
-
+pass
 
 def push_to_ollama(
     tokenizer,
@@ -1708,7 +1743,7 @@ def push_to_ollama(
         gguf_location=gguf_location
     )
 
-    with open(f"Modelfile_{model_name}", "w") as f:
+    with open(f"Modelfile_{model_name}", "w", encoding = "utf-8") as f:
         f.write(model_file)
         f.close()
 
@@ -1726,9 +1761,7 @@ def push_to_ollama(
     )
 
     print("Successfully pushed to ollama")
-
-
-
+pass
 
 
 def unsloth_save_pretrained_gguf(
@@ -1872,7 +1905,7 @@ def unsloth_save_pretrained_gguf(
     modelfile_location = None
     if modelfile is not None:
         modelfile_location = os.path.join(new_save_directory, "Modelfile")
-        with open(modelfile_location, "w") as file:
+        with open(modelfile_location, "w", encoding = "utf-8") as file:
             file.write(modelfile)
         pass
         print(f"Unsloth: Saved Ollama Modelfile to {modelfile_location}")
@@ -2050,7 +2083,7 @@ def unsloth_push_to_hub_gguf(
     modelfile_location = None
     if modelfile is not None:
         modelfile_location = os.path.join(new_save_directory, "Modelfile")
-        with open(modelfile_location, "w") as file:
+        with open(modelfile_location, "w", encoding = "utf-8") as file:
             file.write(modelfile)
         pass
         print(f"Unsloth: Saved Ollama Modelfile to {modelfile_location}")
@@ -2240,6 +2273,8 @@ from unsloth_zoo.llama_cpp import (
 def save_to_gguf_generic(
     model,
     save_directory,
+    tokenizer,
+    quantization_method = None,
     quantization_type = "Q8_0",
     repo_id = None,
     token = None,
@@ -2252,29 +2287,63 @@ def save_to_gguf_generic(
         install_llama_cpp(just_clone_repo = True)
     pass
 
-    metadata = _convert_to_gguf(
-        save_directory,
-        print_output = True,
-        quantization_type = quantization_type,
-    )
-    if repo_id is not None:
-        prepare_saving(
-            model,
-            repo_id,
-            push_to_hub = True,
-            max_shard_size = "50GB",
-            private = True,
-            token = token,
-        )
+    # Use old style quantization_method
+    new_quantization_methods = []
+    if quantization_method is not None:
+        # Convert quantization_method to list
+        if   isinstance(quantization_method, list):  pass
+        elif isinstance(quantization_method, str):   quantization_method = [ quantization_method, ]
+        elif isinstance(quantization_method, tuple): quantization_method = list(quantization_method)
+        else:
+            raise TypeError("Unsloth: quantization_method can only be a string or a list of strings")
+        pass
+        for i, quant_method in enumerate(quantization_method):
+            quant_method = quant_method.lower()
+            if   quant_method == "not_quantized":  quant_method = "f16"
+            elif quant_method == "fast_quantized": quant_method = "q8_0"
+            elif quant_method == "quantized":      quant_method = "q4_k_m"
+            elif quant_method is None:             quant_method = "q8_0"
+            new_quantization_methods.append(quant_method.lower())
+        pass
+    else:
+        new_quantization_methods.append(quantization_type.lower())
+    # Check if wrong method
+    for quant_method in new_quantization_methods:
+        if quant_method not in ALLOWED_QUANTS.keys():
+            error = f"Unsloth: Quant method = [{quant_method}] not supported. Choose from below:\n"
+            for key, value in ALLOWED_QUANTS.items():
+                error += f"[{key}] => {value}\n"
+            raise RuntimeError(error)
+        pass
+    pass
 
-        from huggingface_hub import HfApi
-        api = HfApi(token = token)
-        api.upload_folder(
-            folder_path = save_directory,
-            repo_id = repo_id,
-            repo_type = "model",
-            allow_patterns = ["*.gguf"],
+    # Go through all types and save individually - somewhat inefficient
+    # since we save F16 / BF16 multiple times
+    for quantization_type in new_quantization_methods:
+        metadata = _convert_to_gguf(
+            save_directory,
+            print_output = True,
+            quantization_type = quantization_type,
         )
+        if repo_id is not None:
+            prepare_saving(
+                model,
+                repo_id,
+                push_to_hub = True,
+                max_shard_size = "50GB",
+                private = True,
+                token = token,
+            )
+
+            from huggingface_hub import HfApi
+            api = HfApi(token = token)
+            api.upload_folder(
+                folder_path = save_directory,
+                repo_id = repo_id,
+                repo_type = "model",
+                allow_patterns = ["*.gguf"],
+            )
+        pass
     pass
     return metadata
 pass
