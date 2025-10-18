@@ -21,6 +21,7 @@ from .utils import (
     triton_tanh,
     triton_cast,
     torch_gpu_device,
+    is_cdna,
 )
 from transformers.models.llama.modeling_llama import logger
 from packaging.version import Version
@@ -107,7 +108,7 @@ _cross_entropy_forward = triton.heuristics(
 
 def _chunked_cross_entropy_forward(
     logits_ptr        ,
-    logits_row_stride ,
+    logits_row_stride : tl.constexpr,
     loss_ptr          ,
     logsumexp_ptr     ,
     labels_ptr        ,
@@ -191,9 +192,9 @@ _chunked_cross_entropy_forward = triton.heuristics(
 
 def _cross_entropy_backward(
     logits_ptr        ,
-    logits_row_stride ,
+    logits_row_stride : tl.constexpr,
     dloss_ptr         ,
-    dloss_row_stride  ,
+    dloss_row_stride  : tl.constexpr,
     logsumexp_ptr     ,
     labels_ptr        ,
     VOCAB_SIZE        : tl.constexpr,
@@ -332,7 +333,7 @@ class Fast_CrossEntropyLoss(torch.autograd.Function):
                     SOFTCAP          = logit_softcapping,
                     DO_LOGIT_SCALING = DO_LOGIT_SCALING,
                     LOGIT_SCALE      = logit_scaling,
-                    num_warps        = 32,
+                    num_warps        = 32 if not is_cdna() else 16,
                 )
             # logsumexp(chunked_logsumexp) - x
             # Do the -x separately
