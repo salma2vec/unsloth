@@ -2,6 +2,7 @@
 __pycache__/
 *.py[cod]
 *.class
+unsloth_compiled_cache/
 
 # C extensions
 *.so
@@ -169,6 +170,7 @@ cython_debug/
 
 # Ruff stuff:
 .ruff_cache/
+.pre-commit-cache/
 
 # PyPI configuration file
 .pypirc
