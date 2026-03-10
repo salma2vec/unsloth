@@ -1,8 +1,11 @@
+# SPDX-License-Identifier: GNU Affero General Public License v3.0
+# Copyright 2023-present the Unsloth team. All rights reserved.
+
 import torch
 import triton
 import triton.language as tl
 
-from grouped_gemm.kernels.autotuning import (
+from .autotuning import (
     get_dW_kernel_configs,
     get_dX_kernel_configs,
     prune_dX_configs,
@@ -50,11 +53,11 @@ def _grouped_gemm_dX_kernel(
     m_sizes_ptr,
     # problem sizes
     NUM_EXPERTS: tl.constexpr,
-    NUM_TOKENS: tl.constexpr,
+    NUM_TOKENS,
     TOPK: tl.constexpr,
     N: tl.constexpr,
     K: tl.constexpr,
-    NUM_SMS: tl.constexpr,
+    NUM_SMS,
     # Tuning parameters
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
@@ -66,7 +69,7 @@ def _grouped_gemm_dX_kernel(
     USE_TMA_STORE: tl.constexpr = False,
     FLATTEN: tl.constexpr = True,
 ) -> None:
-    TOTAL_TOKENS: tl.constexpr = NUM_TOKENS * TOPK
+    TOTAL_TOKENS = NUM_TOKENS * TOPK
     output_dtype = dX_ptr.dtype.element_ty
 
     tidx = tl.program_id(0)
@@ -79,20 +82,20 @@ def _grouped_gemm_dX_kernel(
     # Also, we are defining a single global descriptor with single block shape
     # Need to check that this does not result in errors when crossing expert boundaries
     if USE_TMA_LOAD_dY:
-        dY_desc = tl._experimental_make_tensor_descriptor(
+        dY_desc = tl.make_tensor_descriptor(
             dY_ptr,
-            shape=[TOTAL_TOKENS, N],
-            strides=[N, 1],
-            block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_N],
+            shape = [TOTAL_TOKENS, N],
+            strides = [N, 1],
+            block_shape = [BLOCK_SIZE_M, BLOCK_SIZE_N],
         )
 
     if USE_TMA_LOAD_W:
         expert_stride = N * K
-        w_desc = tl._experimental_make_tensor_descriptor(
+        w_desc = tl.make_tensor_descriptor(
             w_ptr,
-            shape=[NUM_EXPERTS, N, K],
-            strides=[expert_stride, K, 1],
-            block_shape=[1, BLOCK_SIZE_N, BLOCK_SIZE_K],
+            shape = [NUM_EXPERTS, N, K],
+            strides = [expert_stride, K, 1],
+            block_shape = [1, BLOCK_SIZE_N, BLOCK_SIZE_K],
         )
 
     m_end = 0
@@ -101,7 +104,7 @@ def _grouped_gemm_dX_kernel(
     n_block_range = tl.arange(0, BLOCK_SIZE_N)
     k_block_range = tl.arange(0, BLOCK_SIZE_K)
 
-    for expert_idx in range(NUM_EXPERTS, flatten=FLATTEN):
+    for expert_idx in range(NUM_EXPERTS, flatten = FLATTEN):
         m_start = m_end
         m_size = tl.load(m_sizes_ptr + expert_idx).to(tl.int32)
         m_end = m_start + m_size
@@ -120,11 +123,11 @@ def _grouped_gemm_dX_kernel(
                 tl.static_assert(
                     K % BLOCK_SIZE_K == 0, "K must be divisible by BLOCK_SIZE_K"
                 )
-                dX_desc = tl._experimental_make_tensor_descriptor(
+                dX_desc = tl.make_tensor_descriptor(
                     dX_ptr,
-                    shape=[m_end, K],
-                    strides=[K, 1],
-                    block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_K],
+                    shape = [m_end, K],
+                    strides = [K, 1],
+                    block_shape = [BLOCK_SIZE_M, BLOCK_SIZE_K],
                 )
 
             # Lower bound and upper bound are defined relative to the total tiles processed so far
@@ -149,7 +152,7 @@ def _grouped_gemm_dX_kernel(
                     )
                     expert_token_idx = tl.load(
                         gather_indices_ptr + indices_to_gather,
-                        mask=indices_to_gather < TOTAL_TOKENS,
+                        mask = indices_to_gather < TOTAL_TOKENS,
                     )
                     expert_token_offsets = expert_token_idx[:, None]
 
@@ -207,13 +210,13 @@ def _grouped_gemm_dX_kernel(
                 # col_mask = offs_bk[None, :] < K
                 store_mask = row_mask  # & col_mask
 
-                accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_K), dtype=tl.float32)
+                accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_K), dtype = tl.float32)
 
                 # GEMM main loop
                 for n_offset in range(0, N, BLOCK_SIZE_N):
                     # dY block [M, N]
                     if not USE_TMA_LOAD_dY:
-                        dY = tl.load(dY_ptrs, mask=row_mask)
+                        dY = tl.load(dY_ptrs, mask = row_mask)
                     else:
                         dY = dY_desc.load(
                             [m_start + tile_m_idx * BLOCK_SIZE_M, n_offset]
@@ -229,6 +232,7 @@ def _grouped_gemm_dX_kernel(
                     # TODO: check if predication along K is needed since we checked that K is divisible by BLOCK_SIZE_K in the forward kernel
 
                     # [M, N] @ [N, K] -> [M, K]
+                    dY = dY.to(w.dtype)
                     accumulator += tl.dot(dY, w)  # NOTE: no transpose of b
 
                     # Advance A along contiguous dimension
@@ -250,7 +254,7 @@ def _grouped_gemm_dX_kernel(
                     tl.store(
                         dX_ptr + store_idx + offs_bk[None, :],
                         dX,
-                        mask=store_mask,
+                        mask = store_mask,
                     )
 
                 # Move to the next tile within this expert group
@@ -261,9 +265,10 @@ def _grouped_gemm_dX_kernel(
 
 
 _autotuned_grouped_gemm_dX_kernel = triton.autotune(
-    configs=get_dX_kernel_configs(),
-    prune_configs_by={"early_config_prune": prune_dX_configs},
-    key=["NUM_EXPERTS", "NUM_TOKENS", "N", "K", "PERMUTE_X", "PERMUTE_Y"],
+    configs = get_dX_kernel_configs(),
+    prune_configs_by = {"early_config_prune": prune_dX_configs},
+    # NOTE: NUM_TOKENS removed from key to avoid recompilation for every sequence length
+    key = ["NUM_EXPERTS", "N", "K", "PERMUTE_X", "PERMUTE_Y"],
 )(_grouped_gemm_dX_kernel)
 
 """
@@ -295,12 +300,12 @@ def _grouped_gemm_dW_kernel(
     m_sizes_ptr,
     gather_indices_ptr,
     # problem sizes
-    NUM_TOKENS: tl.constexpr,
+    NUM_TOKENS,
     TOPK: tl.constexpr,
     NUM_EXPERTS: tl.constexpr,
     N: tl.constexpr,
     K: tl.constexpr,
-    NUM_SMS: tl.constexpr,
+    NUM_SMS,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
@@ -312,26 +317,26 @@ def _grouped_gemm_dW_kernel(
     FLATTEN: tl.constexpr = True,
     acc_dtype: tl.constexpr = tl.float32,
 ) -> None:
-    TOTAL_TOKENS: tl.constexpr = NUM_TOKENS * TOPK
+    TOTAL_TOKENS = NUM_TOKENS * TOPK
     TMA_LOAD_BOTH: tl.constexpr = USE_TMA_LOAD_X and USE_TMA_LOAD_dY
 
     tidx = tl.program_id(0)
     output_dtype = dW_ptr.dtype.element_ty
 
     if USE_TMA_LOAD_dY and not TMA_LOAD_BOTH:
-        dY_desc = tl._experimental_make_tensor_descriptor(
+        dY_desc = tl.make_tensor_descriptor(
             dY_ptr,
-            shape=[TOTAL_TOKENS, N],
-            strides=[N, 1],
-            block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_N],
+            shape = [TOTAL_TOKENS, N],
+            strides = [N, 1],
+            block_shape = [BLOCK_SIZE_M, BLOCK_SIZE_N],
         )
 
     if USE_TMA_LOAD_X and not TMA_LOAD_BOTH:
-        x_desc = tl._experimental_make_tensor_descriptor(
+        x_desc = tl.make_tensor_descriptor(
             x_ptr,
-            shape=[TOTAL_TOKENS, K],
-            strides=[K, 1],
-            block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_K],
+            shape = [TOTAL_TOKENS, K],
+            strides = [K, 1],
+            block_shape = [BLOCK_SIZE_M, BLOCK_SIZE_K],
         )
     # Output tiles per expert, since each expert weight matrix is [N, K]
     num_n_tiles = tl.cdiv(N, BLOCK_SIZE_N)
@@ -346,11 +351,11 @@ def _grouped_gemm_dW_kernel(
     if USE_TMA_STORE:
         tl.static_assert(N % BLOCK_SIZE_N == 0, "N must be divisible by BLOCK_SIZE_N")
         tl.static_assert(K % BLOCK_SIZE_K == 0, "K must be divisible by BLOCK_SIZE_K")
-        dW_desc = tl._experimental_make_tensor_descriptor(
+        dW_desc = tl.make_tensor_descriptor(
             dW_ptr,
-            shape=[NUM_EXPERTS, N, K],
-            strides=[N * K, K, 1],
-            block_shape=[1, BLOCK_SIZE_N, BLOCK_SIZE_K],
+            shape = [NUM_EXPERTS, N, K],
+            strides = [N * K, K, 1],
+            block_shape = [1, BLOCK_SIZE_N, BLOCK_SIZE_K],
         )
 
     for tile_idx in range(
@@ -374,7 +379,7 @@ def _grouped_gemm_dW_kernel(
         m_end = 0
         for expert_idx in range(NUM_EXPERTS):
             # We need to instantiate a fresh accumulator for each expert
-            accumulator = tl.zeros((BLOCK_SIZE_N, BLOCK_SIZE_K), dtype=acc_dtype)
+            accumulator = tl.zeros((BLOCK_SIZE_N, BLOCK_SIZE_K), dtype = acc_dtype)
 
             m_start = m_end
             # Need to figure out why this cast is needed, otherwise compiler complains about mismatching types
@@ -387,18 +392,18 @@ def _grouped_gemm_dW_kernel(
 
             if m_size > 0:
                 if TMA_LOAD_BOTH:
-                    dY_desc = tl._experimental_make_tensor_descriptor(
+                    dY_desc = tl.make_tensor_descriptor(
                         dY_ptr,
-                        shape=[m_end, N],
-                        strides=[N, 1],
-                        block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_N],
+                        shape = [m_end, N],
+                        strides = [N, 1],
+                        block_shape = [BLOCK_SIZE_M, BLOCK_SIZE_N],
                     )
 
-                    x_desc = tl._experimental_make_tensor_descriptor(
+                    x_desc = tl.make_tensor_descriptor(
                         x_ptr,
-                        shape=[m_end, K],
-                        strides=[K, 1],
-                        block_shape=[BLOCK_SIZE_M, BLOCK_SIZE_K],
+                        shape = [m_end, K],
+                        strides = [K, 1],
+                        block_shape = [BLOCK_SIZE_M, BLOCK_SIZE_K],
                     )
 
                 for tile_m_idx in range(0, m_size, BLOCK_SIZE_M):
@@ -422,7 +427,7 @@ def _grouped_gemm_dW_kernel(
                             # indices_to_gather = m_start + gather_offsets
                             expert_token_idx = tl.load(
                                 gather_indices_ptr + indices_to_gather,
-                                mask=indices_to_gather < TOTAL_TOKENS,
+                                mask = indices_to_gather < TOTAL_TOKENS,
                             )
                             expert_token_offsets = expert_token_idx[:, None]
 
@@ -458,7 +463,7 @@ def _grouped_gemm_dW_kernel(
                                 x_ptr
                                 + x_row_load_idx
                                 + (k_offset + block_range_k)[None, :],
-                                mask=mk_mask,
+                                mask = mk_mask,
                             )
 
                         if USE_TMA_LOAD_dY:
@@ -468,11 +473,11 @@ def _grouped_gemm_dW_kernel(
                                 dY_ptr
                                 + dY_row_load_idx
                                 + (n_offset + block_range_n)[None, :],
-                                mask=mn_mask,
+                                mask = mn_mask,
                             )
 
                         accumulator += tl.dot(
-                            dY.T,  # [BLOCK_N, BLOCK_M]
+                            dY.T.to(x.dtype),  # [BLOCK_N, BLOCK_M]
                             x,  # [BLOCK_M, BLOCK_K]
                         )
 
@@ -488,12 +493,13 @@ def _grouped_gemm_dW_kernel(
                         + store_row_offs[:, None] * K
                         + (k_offset + block_range_k)[None, :],
                         y,
-                        mask=nk_mask,
+                        mask = nk_mask,
                     )
 
 
 _autotuned_grouped_gemm_dW_kernel = triton.autotune(
-    configs=get_dW_kernel_configs(),
-    prune_configs_by={"early_config_prune": prune_kernel_configs_backward_dW},
-    key=["NUM_EXPERTS", "NUM_TOKENS", "N", "K", "PERMUTE_X", "PERMUTE_Y"],
+    configs = get_dW_kernel_configs(),
+    prune_configs_by = {"early_config_prune": prune_kernel_configs_backward_dW},
+    # NOTE: NUM_TOKENS removed from key to avoid recompilation for every sequence length
+    key = ["NUM_EXPERTS", "N", "K", "PERMUTE_X", "PERMUTE_Y"],
 )(_grouped_gemm_dW_kernel)

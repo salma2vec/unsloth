@@ -1,21 +1,25 @@
+# SPDX-License-Identifier: GNU Affero General Public License v3.0
+# Copyright 2023-present the Unsloth team. All rights reserved.
+
 import logging
 import warnings
 from dataclasses import asdict
+from unsloth import DEVICE_TYPE
 
 import torch
 import triton
 
-from grouped_gemm.kernels.backward import (
+from .kernels.backward import (
     _autotuned_grouped_gemm_dW_kernel,
     _autotuned_grouped_gemm_dX_kernel,
     _grouped_gemm_dW_kernel,
     _grouped_gemm_dX_kernel,
 )
-from grouped_gemm.kernels.forward import (
+from .kernels.forward import (
     _autotuned_grouped_gemm_forward_kernel,
     _grouped_gemm_forward_kernel,
 )
-from grouped_gemm.kernels.tuning import (
+from .kernels.tuning import (
     KernelConfigBackward_dW,
     KernelConfigBackward_dX,
     KernelConfigForward,
@@ -32,15 +36,57 @@ ch = logging.StreamHandler()
 ch.setFormatter(formatter)
 logger.addHandler(ch)
 
-_FUSED_MUL_WARN = False
-_SUPPORTS_TMA = None
+
+# Precompute TMA support to avoid graph breaks
+# TMA requires both:
+# 1. NVIDIA GPU with capability >= 9 (Hopper+)
+# 2. Triton version with TMA API (make_tensor_descriptor or _experimental_make_tensor_descriptor)
+def _check_tma_support():
+    if DEVICE_TYPE in ("xpu", "hip"):
+        return False
+    import triton.language as tl
+
+    gpu_supports_tma = torch.cuda.get_device_capability()[0] >= 9
+    # Check for both old experimental and new stable API names
+    triton_has_tma_api = hasattr(tl, "make_tensor_descriptor") or hasattr(
+        tl, "_experimental_make_tensor_descriptor"
+    )
+    return gpu_supports_tma and triton_has_tma_api
+
+
+_SUPPORTS_TMA = _check_tma_support()
+
+# Check if triton.set_allocator is available (Triton 3.0+)
+_HAS_SET_ALLOCATOR = hasattr(triton, "set_allocator")
 
 
 def supports_tma():
-    global _SUPPORTS_TMA
-    if _SUPPORTS_TMA is None:
-        _SUPPORTS_TMA = torch.cuda.get_device_capability()[0] >= 9
     return _SUPPORTS_TMA
+
+
+# Helper to support allow_in_graph
+try:
+    from torch.compiler import allow_in_graph
+except ImportError:
+    from torch._dynamo import allow_in_graph
+
+
+# Helper to detect if we're in tracing/compilation mode
+def _is_tracing(*tensors):
+    """
+    Check if tensors are fake tensors used during torch.compile tracing.
+    During tracing, tensors are FakeTensor/FunctionalTensor and we can't run Triton kernels.
+    During execution, tensors are real Tensors and we MUST run the kernels.
+
+    NOTE: We do NOT use torch.compiler.is_compiling() because it returns True
+    during both tracing AND execution. We only want to skip kernels during tracing
+    when tensors are actually fake.
+    """
+    for t in tensors:
+        name = type(t).__name__
+        if name in ("FakeTensor", "FunctionalTensor", "FunctionalTensorWrapper"):
+            return True
+    return False
 
 
 _per_device_alloc_fns = {}
@@ -57,7 +103,7 @@ def get_per_device_per_stream_alloc_fn(device):
                 or _per_stream_tensors[stream].numel() < size
             ):
                 _per_stream_tensors[stream] = torch.empty(
-                    size, device=device, dtype=torch.int8
+                    size, device = device, dtype = torch.int8
                 )
                 _per_stream_tensors[stream].__hibernate__ = {"type": "ignore"}
             return _per_stream_tensors[stream]
@@ -80,6 +126,7 @@ def log_kernel_info(
         logger.debug(f"{kernel_name} autotuned best_config: {best_config}")
 
 
+@allow_in_graph
 def grouped_gemm_forward(
     X: torch.Tensor,
     W: torch.Tensor,
@@ -155,39 +202,47 @@ def grouped_gemm_forward(
         use_tma_store = False
 
     if use_tma or autotune:
+        # Respect global persistent allocator if set
+        if _HAS_SET_ALLOCATOR and not getattr(triton, "_unsloth_allocator_set", False):
 
-        def alloc_fn(size: int, alignment: int, stream: int):
-            return torch.empty(size, device="cuda", dtype=torch.int8)
+            def alloc_fn(size: int, alignment: int, stream: int):
+                return torch.empty(size, device = "cuda", dtype = torch.int8)
 
-        triton.set_allocator(alloc_fn)
+            triton.set_allocator(alloc_fn)
+
+    if W.ndim == 3:
+        num_experts = W.shape[0]
+        N = W.shape[1]
+        # K = W.shape[2]
+    else:
+        num_experts = m_sizes.shape[0]
+        N = W.shape[0] // num_experts
 
     X = X.view(-1, X.shape[-1])
     W = W.view(-1, W.shape[-1])
 
     if permute_x or permute_y:
-        assert gather_indices is not None, (
-            "gather_indices must be provided when permute_x or permute_y is True"
-        )
+        assert (
+            gather_indices is not None
+        ), "gather_indices must be provided when permute_x or permute_y is True"
         assert gather_indices.is_contiguous()
         assert gather_indices.device.type == "cuda"
         assert gather_indices.ndim == 1
         total_tokens = gather_indices.shape[0]
         num_tokens = total_tokens // topk
         if permute_x:
-            assert X.shape[0] == num_tokens, (
-                f"X.shape[0] ({X.shape[0]}) must match num_tokens ({num_tokens})"
-            )
+            assert (
+                X.shape[0] == num_tokens
+            ), f"X.shape[0] ({X.shape[0]}) must match num_tokens ({num_tokens})"
         else:
-            assert X.shape[0] == total_tokens, (
-                f"X.shape[0] ({X.shape[0]}) must match total_tokens ({total_tokens})"
-            )
+            assert (
+                X.shape[0] == total_tokens
+            ), f"X.shape[0] ({X.shape[0]}) must match total_tokens ({total_tokens})"
     else:
         total_tokens = X.shape[0]
         num_tokens = total_tokens // topk
 
-    num_experts = m_sizes.shape[0]
     _, K = X.shape
-    N = W.shape[0] // num_experts
     assert K == W.shape[1], f"K ({K}) must match W.shape[1] ({W.shape[1]})"
 
     if fuse_mul_post:
@@ -208,9 +263,9 @@ def grouped_gemm_forward(
                 f"DEBUG::GROUPED_GEMM {topk_weights.tolist()} {gather_indices.tolist()}"
             )
 
-    y = torch.empty((total_tokens, N), device=X.device, dtype=X.dtype)
-    if total_tokens == 0 or N == 0:
-        return y
+    y = torch.empty((total_tokens, N), device = X.device, dtype = X.dtype)
+    # if total_tokens == 0 or N == 0:
+    #     return y
 
     NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
 
@@ -218,13 +273,13 @@ def grouped_gemm_forward(
         return (NUM_SMS,)
 
     if not autotune:
-        BLOCK_SIZE_K = min(K, BLOCK_SIZE_K)
-        BLOCK_SIZE_N = min(N, BLOCK_SIZE_N)
-        BLOCK_SIZE_M = min(total_tokens, BLOCK_SIZE_M)
+        # BLOCK_SIZE_K = min(K, BLOCK_SIZE_K)
+        # BLOCK_SIZE_N = min(N, BLOCK_SIZE_N)
+        pass
 
     if debug:
         print(
-            f"DEBUG::GROUPED_GEMM {num_tokens=} {topk=} {num_experts=} {N=} {K=} {BLOCK_SIZE_M=} {BLOCK_SIZE_N=} {BLOCK_SIZE_K=} {permute_x=}"
+            f"DEBUG::GROUPED_GEMM {num_tokens = } {topk = } {num_experts = } {N = } {K = } {BLOCK_SIZE_M = } {BLOCK_SIZE_N = } {BLOCK_SIZE_K = } {permute_x = }"
         )
         print(
             f"DEBUG::GROUPED_GEMM {m_sizes.tolist()} {(gather_indices // topk).tolist()}"
@@ -273,16 +328,19 @@ def grouped_gemm_forward(
         if autotune
         else _grouped_gemm_forward_kernel
     )
-    compiled_kernel: triton.compiler.CompiledKernel = kernel[grid](**kernel_args)
 
-    if autotune:
-        log_kernel_info(compiled_kernel, kernel.best_config)
-    else:
-        log_kernel_info(compiled_kernel)
+    is_fake = _is_tracing(X, W)
+    if not is_fake:
+        compiled_kernel: triton.compiler.CompiledKernel = kernel[grid](**kernel_args)
+        if autotune:
+            log_kernel_info(compiled_kernel, kernel.best_config)
+        else:
+            log_kernel_info(compiled_kernel)
 
     return y
 
 
+@allow_in_graph
 def grouped_gemm_dX(
     dY: torch.Tensor,
     W: torch.Tensor,
@@ -325,12 +383,12 @@ def grouped_gemm_dX(
     use_tma_load_w: use TMA for loading weights.  If TMA supported, this should always be enabled as it is faster than global memory load.
     use_tma_store: use TMA for storing dX.  Incompatible with permute_x.  TODO: add TMA gather / scatter support for Blackwell+ which will enable permute_x and use_tma_store.
     """
-    assert not fuse_mul_pre, (
-        "fuse_mul_pre should only be used for inference, not for training"
-    )
-    assert not fuse_mul_post, (
-        "fuse_mul_post should only be used for inference, not for training"
-    )
+    assert (
+        not fuse_mul_pre
+    ), "fuse_mul_pre should only be used for inference, not for training"
+    assert (
+        not fuse_mul_post
+    ), "fuse_mul_post should only be used for inference, not for training"
     assert dY.is_contiguous()
     assert W.is_contiguous()
     assert m_sizes.is_contiguous()
@@ -351,36 +409,44 @@ def grouped_gemm_dX(
         use_tma_store = False
 
     if use_tma or autotune:
+        # Respect global persistent allocator if set
+        if _HAS_SET_ALLOCATOR and not getattr(triton, "_unsloth_allocator_set", False):
 
-        def alloc_fn(size: int, alignment: int, stream: int):
-            # print(f"DEBUG::GROUPED_GEMM alloc_fn {size=} {alignment=} {stream=}")
-            return torch.empty(size, device="cuda", dtype=torch.int8)
+            def alloc_fn(size: int, alignment: int, stream: int):
+                # print(f"DEBUG::GROUPED_GEMM alloc_fn {size=} {alignment=} {stream=}")
+                return torch.empty(size, device = "cuda", dtype = torch.int8)
 
-        triton.set_allocator(alloc_fn)
+            triton.set_allocator(alloc_fn)
 
-    num_experts = m_sizes.shape[0]
+    if W.ndim == 3:
+        num_experts = W.shape[0]
+        N = W.shape[1]
+    else:
+        num_experts = m_sizes.shape[0]
+        N = W.shape[0] // num_experts
+
     dY = dY.view(-1, dY.shape[-1])
     W = W.view(-1, W.shape[-1])
 
     M_total, N_grad = dY.shape
     N_total, K = W.shape
-    N = N_total // num_experts
+    # N = N_total // num_experts
     assert N_grad == N, f"Grad_output N ({N_grad}) must match weight N ({N})"
 
-    assert M_total % topk == 0, (
-        f"M_total ({M_total}) must be divisible by topk ({topk})"
-    )
+    assert (
+        M_total % topk == 0
+    ), f"M_total ({M_total}) must be divisible by topk ({topk})"
     num_tokens = M_total // topk
 
     total_tokens = gather_indices.shape[0]
-    assert total_tokens == M_total, (
-        f"Total tokens ({total_tokens}) must match M_total ({M_total})"
-    )
+    assert (
+        total_tokens == M_total
+    ), f"Total tokens ({total_tokens}) must match M_total ({M_total})"
 
     # Note that the output shape is [NUM_TOKENS * TOPK, K] even when `permute_x` is True since we need to accumulate gradients across all experts chosen by the token.
     # This will be done in a post-processing step reduction step.
     output_shape = (total_tokens, K)
-    dX = torch.zeros(output_shape, device=dY.device, dtype=dY.dtype)
+    dX = torch.zeros(output_shape, device = dY.device, dtype = dY.dtype)
 
     NUM_SMS = torch.cuda.get_device_properties(
         "cuda"
@@ -390,13 +456,13 @@ def grouped_gemm_dX(
         return (NUM_SMS,)
 
     if not autotune:
-        BLOCK_SIZE_M = min(M_total, BLOCK_SIZE_M)
-        BLOCK_SIZE_N = min(N_grad, BLOCK_SIZE_N)
-        BLOCK_SIZE_K = min(K, BLOCK_SIZE_K)
+        # BLOCK_SIZE_N = min(N_grad, BLOCK_SIZE_N)
+        # BLOCK_SIZE_K = min(K, BLOCK_SIZE_K)
+        pass
 
     if debug:
         print(
-            f"DEBUG::GROUPED_GEMM {num_tokens=} {topk=} {output_shape=} {num_experts=} {N=} {K=} {BLOCK_SIZE_M=} {BLOCK_SIZE_N=} {BLOCK_SIZE_K=} {NUM_SMS=}"
+            f"DEBUG::GROUPED_GEMM {num_tokens = } {topk = } {output_shape = } {num_experts = } {N = } {K = } {BLOCK_SIZE_M = } {BLOCK_SIZE_N = } {BLOCK_SIZE_K = } {NUM_SMS = }"
         )
         print(f"DEBUG::GROUPED_GEMM {m_sizes.tolist()}")
 
@@ -434,15 +500,19 @@ def grouped_gemm_dX(
             }
         )
     kernel = _autotuned_grouped_gemm_dX_kernel if autotune else _grouped_gemm_dX_kernel
-    compiled_kernel: triton.compiler.CompiledKernel = kernel[grid](**kernel_args)
 
-    if autotune:
-        log_kernel_info(compiled_kernel, kernel.best_config)
-    else:
-        log_kernel_info(compiled_kernel)
+    is_fake = _is_tracing(dY, W)
+    if not is_fake:
+        compiled_kernel: triton.compiler.CompiledKernel = kernel[grid](**kernel_args)
+
+        if autotune:
+            log_kernel_info(compiled_kernel, kernel.best_config)
+        else:
+            log_kernel_info(compiled_kernel)
     return dX
 
 
+@allow_in_graph
 def grouped_gemm_dW(
     X: torch.Tensor,
     dY: torch.Tensor,
@@ -507,11 +577,13 @@ def grouped_gemm_dW(
         use_tma_store = False
 
     if use_tma or autotune:
+        # Respect global persistent allocator if set
+        if _HAS_SET_ALLOCATOR and not getattr(triton, "_unsloth_allocator_set", False):
 
-        def alloc_fn(size: int, alignment: int, stream: int):
-            return torch.empty(size, device="cuda", dtype=torch.int8)
+            def alloc_fn(size: int, alignment: int, stream: int):
+                return torch.empty(size, device = "cuda", dtype = torch.int8)
 
-        triton.set_allocator(alloc_fn)
+            triton.set_allocator(alloc_fn)
 
     if permute_x or permute_y:
         assert gather_indices is not None
@@ -535,23 +607,23 @@ def grouped_gemm_dW(
 
     assert M_grad == total_tokens, f"dY M ({M_grad}) != total_tokens ({total_tokens})"
 
-    dW = torch.zeros((num_experts, N, K), device=X.device, dtype=X.dtype)
+    dW = torch.zeros((num_experts, N, K), device = X.device, dtype = X.dtype)
 
     if not autotune:
-        BLOCK_SIZE_M = min(total_tokens, BLOCK_SIZE_M)
-        BLOCK_SIZE_N = min(N, BLOCK_SIZE_N)
-        BLOCK_SIZE_K = min(K, BLOCK_SIZE_K)
+        # BLOCK_SIZE_N = min(N, BLOCK_SIZE_N)
+        # BLOCK_SIZE_K = min(K, BLOCK_SIZE_K)
+        pass
 
     def grid(META):
         return (NUM_SMS,)
 
     if debug:
         print(
-            f"DEBUG::GROUPED_GEMM_DW_TMA {num_experts=} {N=} {K=} {BLOCK_SIZE_M=} {BLOCK_SIZE_N=} {BLOCK_SIZE_K=} {NUM_SMS=}"
+            f"DEBUG::GROUPED_GEMM_DW_TMA {num_experts = } {N = } {K = } {BLOCK_SIZE_M = } {BLOCK_SIZE_N = } {BLOCK_SIZE_K = } {NUM_SMS = }"
         )
 
-        print(f"DEBUG::GROUPED_GEMM_DW_TMA {m_sizes.tolist()=}")
-        print(f"DEBUG::GROUPED_GEMM_DW_TMA {gather_indices.tolist()=}")
+        print(f"DEBUG::GROUPED_GEMM_DW_TMA {m_sizes.tolist() = }")
+        print(f"DEBUG::GROUPED_GEMM_DW_TMA {gather_indices.tolist() = }")
         m_start = 0
         for i in range(num_experts):
             expert_token_idx = gather_indices[m_start : m_start + m_sizes[i]]
@@ -604,12 +676,15 @@ def grouped_gemm_dW(
         )
 
     kernel = _autotuned_grouped_gemm_dW_kernel if autotune else _grouped_gemm_dW_kernel
-    compiled_kernel: triton.compiler.CompiledKernel = kernel[grid](**kernel_args)
 
-    if autotune:
-        log_kernel_info(compiled_kernel, kernel.best_config)
-    else:
-        log_kernel_info(compiled_kernel)
+    is_fake = _is_tracing(X, dY)
+    if not is_fake:
+        compiled_kernel: triton.compiler.CompiledKernel = kernel[grid](**kernel_args)
+
+        if autotune:
+            log_kernel_info(compiled_kernel, kernel.best_config)
+        else:
+            log_kernel_info(compiled_kernel)
 
     return dW
 
@@ -660,23 +735,24 @@ class GroupedGemm(torch.autograd.Function):
             fwd_config["use_tma_store"] = kernel_config_fwd.use_tma_store
 
         return grouped_gemm_forward(
-            X=X,
-            W=W,
-            topk=topk,
-            m_sizes=m_sizes,
-            gather_indices=gather_indices,
-            topk_weights=topk_weights,
-            permute_x=permute_x,
-            permute_y=permute_y,
-            fuse_mul_post=fuse_mul_post,
+            X = X,
+            W = W,
+            topk = topk,
+            m_sizes = m_sizes,
+            gather_indices = gather_indices,
+            topk_weights = topk_weights,
+            permute_x = permute_x,
+            permute_y = permute_y,
+            fuse_mul_post = fuse_mul_post,
             # Autotune -- this will override the manual kernel config if true
-            autotune=autotune,
+            autotune = autotune,
             # Manual kernel config
             **fwd_config,
         )
 
     @staticmethod
     def backward(ctx, dY):
+        dY = dY.contiguous()
         X, W, m_sizes, gather_indices = ctx.saved_tensors
         topk = ctx.topk
         permute_x = ctx.permute_x
@@ -690,17 +766,17 @@ class GroupedGemm(torch.autograd.Function):
 
         if not autotune:
             if not dW_only:
-                assert kernel_config_bwd_dX is not None, (
-                    "kernel_config_bwd_dX must be provided if autotune is False"
-                )
+                assert (
+                    kernel_config_bwd_dX is not None
+                ), "kernel_config_bwd_dX must be provided if autotune is False"
             if not dX_only:
-                assert kernel_config_bwd_dW is not None, (
-                    "kernel_config_bwd_dW must be provided if autotune is False"
-                )
+                assert (
+                    kernel_config_bwd_dW is not None
+                ), "kernel_config_bwd_dW must be provided if autotune is False"
 
-        assert not fuse_mul_post, (
-            "fused_mul should only be used for inference, not for training"
-        )
+        assert (
+            not fuse_mul_post
+        ), "fused_mul should only be used for inference, not for training"
 
         if not dX_only:
             bwd_dW_config = {}
@@ -716,15 +792,15 @@ class GroupedGemm(torch.autograd.Function):
                 bwd_dW_config["num_stages"] = kernel_config_bwd_dW.num_stages
 
             dW = grouped_gemm_dW(
-                X=X,
-                dY=dY,
-                m_sizes=m_sizes,
-                gather_indices=gather_indices,
-                topk=topk,
-                permute_x=permute_x,
-                permute_y=permute_y,
+                X = X,
+                dY = dY,
+                m_sizes = m_sizes,
+                gather_indices = gather_indices,
+                topk = topk,
+                permute_x = permute_x,
+                permute_y = permute_y,
                 # Autotune -- this will override the manual kernel config if true
-                autotune=autotune,
+                autotune = autotune,
                 # Manual kernel config
                 **bwd_dW_config,
             )
@@ -744,21 +820,21 @@ class GroupedGemm(torch.autograd.Function):
                 bwd_dX_config["num_stages"] = kernel_config_bwd_dX.num_stages
 
             dX = grouped_gemm_dX(
-                dY=dY,
-                W=W,
-                m_sizes=m_sizes,
-                gather_indices=gather_indices,
-                topk=topk,
-                permute_x=permute_x,
-                permute_y=permute_y,
+                dY = dY,
+                W = W,
+                m_sizes = m_sizes,
+                gather_indices = gather_indices,
+                topk = topk,
+                permute_x = permute_x,
+                permute_y = permute_y,
                 # Autotune -- this will override the manual kernel config if true
-                autotune=autotune,
+                autotune = autotune,
                 # Manual kernel config
                 **bwd_dX_config,
             )
 
             if topk > 1 and permute_x:
-                dX = dX.view(X.shape[0], topk, -1).sum(dim=1)
+                dX = dX.view(X.shape[0], topk, -1).sum(dim = 1)
         else:
             dX = None
 
@@ -796,21 +872,21 @@ def check_valid_config_fwd(
     is_second_gemm = not is_first_gemm
 
     assert not (permute_x and permute_y), "Cannot permute both X and Y"
-    assert not (is_second_gemm and permute_x), (
-        "Cannot permute X for the second grouped GEMM"
-    )
-    assert not (is_first_gemm and permute_y), (
-        "Cannot permute Y for the first grouped GEMM"
-    )
-    assert not (fuse_mul_post and is_first_gemm), (
-        "Cannot fuse mul for the first grouped GEMM"
-    )
-    assert not (use_tma_load_x and permute_x), (
-        "Cannot use TMA load and permute X unless on sm100+ (Blackwell+)"
-    )
-    assert not (use_tma_store and permute_y and is_second_gemm), (
-        "Cannot use TMA store and permute Y for the second grouped GEMM unless on sm100+ (Blackwell+)"
-    )
+    assert not (
+        is_second_gemm and permute_x
+    ), "Cannot permute X for the second grouped GEMM"
+    assert not (
+        is_first_gemm and permute_y
+    ), "Cannot permute Y for the first grouped GEMM"
+    assert not (
+        fuse_mul_post and is_first_gemm
+    ), "Cannot fuse mul for the first grouped GEMM"
+    assert not (
+        use_tma_load_x and permute_x
+    ), "Cannot use TMA load and permute X unless on sm100+ (Blackwell+)"
+    assert not (
+        use_tma_store and permute_y and is_second_gemm
+    ), "Cannot use TMA store and permute Y for the second grouped GEMM unless on sm100+ (Blackwell+)"
 
 
 def check_valid_config_bwd_dW(
@@ -863,8 +939,8 @@ def grouped_gemm(
     gather_indices: torch.Tensor = None,
     permute_x: bool = False,
     permute_y: bool = False,
-    topk_weights=None,
-    fuse_mul_post=False,
+    topk_weights = None,
+    fuse_mul_post = False,
     kernel_config_fwd: KernelConfigForward = None,
     kernel_config_bwd_dX: KernelConfigBackward_dX = None,
     kernel_config_bwd_dW: KernelConfigBackward_dW = None,
@@ -898,49 +974,49 @@ def grouped_gemm(
 
     """
     if not autotune:
-        assert kernel_config_fwd is not None, (
-            "kernel_config_fwd must be provided if autotune is False"
-        )
+        assert (
+            kernel_config_fwd is not None
+        ), "kernel_config_fwd must be provided if autotune is False"
 
         check_valid_config_fwd(
             permute_x,
             permute_y,
-            use_tma_load_x=kernel_config_fwd.use_tma_load_x,
-            use_tma_load_w=kernel_config_fwd.use_tma_load_w,
-            use_tma_store=kernel_config_fwd.use_tma_store,
-            fuse_mul_post=fuse_mul_post,
-            is_first_gemm=is_first_gemm,
+            use_tma_load_x = kernel_config_fwd.use_tma_load_x,
+            use_tma_load_w = kernel_config_fwd.use_tma_load_w,
+            use_tma_store = kernel_config_fwd.use_tma_store,
+            fuse_mul_post = fuse_mul_post,
+            is_first_gemm = is_first_gemm,
         )
         if kernel_config_bwd_dW is not None and not dX_only:
             check_valid_config_bwd_dW(
                 permute_x,
                 permute_y,
-                use_tma_load_dY=kernel_config_bwd_dW.use_tma_load_dy,
-                use_tma_load_x=kernel_config_bwd_dW.use_tma_load_x,
-                use_tma_store=kernel_config_bwd_dW.use_tma_store,
-                fuse_mul_post=fuse_mul_post,
-                is_first_gemm=is_first_gemm,
+                use_tma_load_dY = kernel_config_bwd_dW.use_tma_load_dy,
+                use_tma_load_x = kernel_config_bwd_dW.use_tma_load_x,
+                use_tma_store = kernel_config_bwd_dW.use_tma_store,
+                fuse_mul_post = fuse_mul_post,
+                is_first_gemm = is_first_gemm,
             )
         if kernel_config_bwd_dX is not None and not dW_only:
             check_valid_config_bwd_dX(
                 permute_x,
                 permute_y,
-                use_tma_load_dY=kernel_config_bwd_dX.use_tma_load_dy,
-                use_tma_load_w=kernel_config_bwd_dX.use_tma_load_w,
-                use_tma_store=kernel_config_bwd_dX.use_tma_store,
-                fuse_mul_post=fuse_mul_post,
-                is_first_gemm=is_first_gemm,
+                use_tma_load_dY = kernel_config_bwd_dX.use_tma_load_dy,
+                use_tma_load_w = kernel_config_bwd_dX.use_tma_load_w,
+                use_tma_store = kernel_config_bwd_dX.use_tma_store,
+                fuse_mul_post = fuse_mul_post,
+                is_first_gemm = is_first_gemm,
             )
 
     if permute_x or permute_y:
-        assert gather_indices is not None, (
-            "gather_indices is required when either permute_x or permute_y is True"
-        )
+        assert (
+            gather_indices is not None
+        ), "gather_indices is required when either permute_x or permute_y is True"
 
     if fuse_mul_post:
-        assert topk_weights is not None, (
-            "topk_weights is required when fuse_mul_post is True"
-        )
+        assert (
+            topk_weights is not None
+        ), "topk_weights is required when fuse_mul_post is True"
 
     X = X.view(-1, X.shape[-1])
     m_sizes = m_sizes.view(-1)
